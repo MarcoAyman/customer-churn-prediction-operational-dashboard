@@ -4,19 +4,38 @@
   CUSTOM HOOK: useSSE
   Manages a Server-Sent Events (SSE) connection to the FastAPI backend.
 
-  FIX APPLIED:
-    The browser's EventSource API cannot send custom HTTP headers.
-    This is a browser spec limitation — not a bug in our code.
+  FIX 1 (existing — kept):
+    EventSource cannot send custom HTTP headers (browser spec limitation).
+    Admin key is sent as a URL query param instead.
+
+  FIX 2 (NEW — this update):
+    Exponential backoff on reconnect.
 
     BEFORE (broken):
-      const es = new EventSource(SSE_ENDPOINT)
-      // X-Admin-Key header never reaches the server → 403
+      const RECONNECT_DELAY_MS = 3_000  ← fixed 3s forever
+      // On a cold Render server, 3s is too short.
+      // Chrome fires 15+ rapid reconnects in 45 seconds, each failing.
+      // Chrome then marks the origin as broken and the SSE never recovers
+      // even after Render is fully awake.
 
     AFTER (fixed):
-      const es = new EventSource(`${SSE_ENDPOINT}?admin_key=${ADMIN_KEY}`)
-      // Admin key travels in the URL query param → FastAPI accepts it
+      retryDelayRef starts at 3_000ms.
+      Each failed connection attempt multiplies by 1.5.
+      Caps at 30_000ms (30 seconds) so we never wait too long.
+      Resets to 3_000ms the moment a connection opens successfully.
 
-  The backend event.py route was updated to accept ?admin_key= for this reason.
+      Timeline on a cold Render start:
+        Attempt 1 → fails → wait 3s
+        Attempt 2 → fails → wait 4.5s
+        Attempt 3 → fails → wait 6.75s
+        Attempt 4 → fails → wait 10s
+        Attempt 5 → succeeds (Render is now warm) → reset to 3s ✓
+
+    WHY NOT FIXED DELAY?
+      A short fixed delay hammers a cold server repeatedly.
+      A long fixed delay makes reconnect feel sluggish once the server is warm.
+      Exponential backoff gives the server time to wake up while recovering
+      quickly once it's ready.
   ─────────────────────────────────────────────────────────────────────────────
 */
 
@@ -25,48 +44,43 @@ import { MOCK_INITIAL_EVENTS } from '../data/mockData'
 
 // ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-// Set to false when FastAPI is running and reachable
 const MOCK_MODE = false
 
-// Base API URL from Vite environment variable
-// Falls back to empty string for same-origin requests in development
-const BASE_URL = import.meta.env.VITE_API_URL || ''
-
-// Admin API key from Vite environment variable
-// Sent as query param because EventSource cannot send custom headers
+const BASE_URL  = import.meta.env.VITE_API_URL  || ''
 const ADMIN_KEY = import.meta.env.VITE_ADMIN_KEY || ''
 
-// SSE endpoint — admin_key appended as query param (browser spec requirement)
 const SSE_ENDPOINT = `${BASE_URL}/api/v1/admin/events?admin_key=${ADMIN_KEY}`
 
-// Maximum events to keep in the feed before dropping oldest
+// Maximum events to keep in the live feed
 const MAX_EVENTS = 50
 
-// Seconds to wait before reconnecting after a connection error
-const RECONNECT_DELAY_MS = 3000
+// Backoff configuration
+const RECONNECT_INITIAL_MS = 3_000   // first retry after 3 seconds
+const RECONNECT_MULTIPLIER = 1.5     // multiply delay by this on each failure
+const RECONNECT_MAX_MS     = 30_000  // never wait longer than 30 seconds
 
 
 // ── HOOK ──────────────────────────────────────────────────────────────────────
 
 export function useSSE() {
-  // events: array of event objects, newest first
-  const [events, setEvents] = useState(MOCK_MODE ? MOCK_INITIAL_EVENTS : [])
+  const [events, setEvents]   = useState(MOCK_MODE ? MOCK_INITIAL_EVENTS : [])
+  const [status, setStatus]   = useState(MOCK_MODE ? 'mock' : 'connecting')
 
-  // SSE connection status
-  const [status, setStatus] = useState(MOCK_MODE ? 'mock' : 'connecting')
-
-  // Ref to the EventSource instance — persists across renders without re-render
+  // Ref to the active EventSource instance
   const eventSourceRef = useRef(null)
 
-  // Adds a new event to the front of the array and trims to MAX_EVENTS
+  // FIX: mutable ref for current retry delay — persists across renders
+  // without triggering re-renders (unlike useState)
+  const retryDelayRef  = useRef(RECONNECT_INITIAL_MS)
+
+  // Ref to the pending reconnect timeout — so we can cancel it on unmount
+  const retryTimerRef  = useRef(null)
+
+
   const addEvent = useCallback((newEvent) => {
-    setEvents(prev => {
-      const updated = [newEvent, ...prev]
-      return updated.slice(0, MAX_EVENTS)
-    })
+    setEvents(prev => [newEvent, ...prev].slice(0, MAX_EVENTS))
   }, [])
 
-  // Empties the event list — for the "clear" button
   const clearEvents = useCallback(() => {
     setEvents([])
   }, [])
@@ -76,78 +90,79 @@ export function useSSE() {
 
     // ── MOCK MODE ─────────────────────────────────────────────────────────────
     if (MOCK_MODE) {
-      // Simulate incoming SSE events every 8 seconds during development
-      const simulatedEvents = [
-        { event_type: 'ping',           payload: {},                                         created_at: new Date().toISOString() },
-        { event_type: 'new_customer',   payload: { customer_id: '#50999', city_tier: 2 },    created_at: new Date().toISOString() },
-        { event_type: 'high_churn_alert', payload: { customer_id: '#50500', score: 1.0, top_reason: 'Complaint raised' }, created_at: new Date().toISOString() },
-        { event_type: 'ping',           payload: {},                                         created_at: new Date().toISOString() },
+      const mockEvents = [
+        { event_type: 'ping',             payload: {},                                                              created_at: new Date().toISOString() },
+        { event_type: 'new_customer',     payload: { customer_id: '#50999', city_tier: 2 },                        created_at: new Date().toISOString() },
+        { event_type: 'high_churn_alert', payload: { customer_id: '#50500', score: 1.0, top_reason: 'Complaint' }, created_at: new Date().toISOString() },
       ]
-      let simulatedIndex = 0
+      let idx = 0
       const interval = setInterval(() => {
-        const evt = simulatedEvents[simulatedIndex % simulatedEvents.length]
-        addEvent({ ...evt, id: `mock-${Date.now()}`, created_at: new Date().toISOString() })
-        simulatedIndex++
-      }, 8000)
-
+        addEvent({ ...mockEvents[idx % mockEvents.length], id: `mock-${Date.now()}`, created_at: new Date().toISOString() })
+        idx++
+      }, 8_000)
       return () => clearInterval(interval)
     }
 
 
     // ── REAL SSE MODE ─────────────────────────────────────────────────────────
 
-    // Validate that ADMIN_KEY is set before attempting connection
-    // If empty, the server will return 403 and we reconnect forever pointlessly
     if (!ADMIN_KEY) {
-      console.error(
-        '[SSE] VITE_ADMIN_KEY is not set. ' +
-        'Add it to your Vercel environment variables and redeploy.'
-      )
+      console.error('[SSE] VITE_ADMIN_KEY is not set. Add it to Vercel env vars and redeploy.')
       setStatus('error')
       return
     }
 
     function connect() {
       setStatus('connecting')
+      console.log(`[SSE] Connecting... (retry delay: ${retryDelayRef.current}ms)`)
 
-      // EventSource: browser's built-in SSE client.
-      // We append ?admin_key= because EventSource cannot send custom headers.
-      // The URL is built at the top of this file.
-      console.log(`[SSE] Connecting to: ${BASE_URL}/api/v1/admin/events?admin_key=****`)
       const es = new EventSource(SSE_ENDPOINT)
       eventSourceRef.current = es
 
-      // onopen: SSE connection established successfully
       es.onopen = () => {
         setStatus('connected')
-        console.log('[SSE] Connected successfully')
+        console.log('[SSE] ✓ Connected successfully')
+
+        // FIX: reset backoff delay on successful connection.
+        // Next disconnect will start the retry sequence from scratch at 3s.
+        retryDelayRef.current = RECONNECT_INITIAL_MS
       }
 
-      // onmessage: called for every "data: ...\n\n" chunk from FastAPI
       es.onmessage = (event) => {
         try {
-          const parsed = JSON.parse(event.data)
-          addEvent(parsed)
+          addEvent(JSON.parse(event.data))
         } catch (err) {
           console.warn('[SSE] Failed to parse event:', event.data, err)
         }
       }
 
-      // onerror: connection dropped or server returned error
-      es.onerror = (err) => {
+      es.onerror = () => {
         setStatus('error')
-        console.error('[SSE] Connection error. Will retry in', RECONNECT_DELAY_MS, 'ms')
         es.close()
         eventSourceRef.current = null
-        // Wait before reconnecting — avoids hammering a sleeping Render server
-        setTimeout(connect, RECONNECT_DELAY_MS)
+
+        const delay = retryDelayRef.current
+        console.warn(`[SSE] Connection failed. Retrying in ${delay}ms...`)
+
+        // FIX: increase delay for next attempt, capped at RECONNECT_MAX_MS
+        retryDelayRef.current = Math.min(
+          delay * RECONNECT_MULTIPLIER,
+          RECONNECT_MAX_MS
+        )
+
+        // Store the timer ref so we can cancel it on unmount
+        retryTimerRef.current = setTimeout(connect, delay)
       }
     }
 
     connect()
 
-    // Cleanup: close connection when component unmounts
+    // Cleanup: close connection and cancel any pending retry on unmount
     return () => {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
       if (eventSourceRef.current) {
         eventSourceRef.current.close()
         eventSourceRef.current = null
